@@ -4,7 +4,6 @@
 # DeepSpeed Team
 
 from dataclasses import dataclass
-from deepspeed import comm as dist
 from deepspeed.utils import log_dist
 
 
@@ -24,9 +23,20 @@ class PartitionedParameterProfiler(object):
             self.count += 1
             self.num_elem += numel
 
+    @dataclass
+    class BandwidthCounter:
+        element_size: int
+        numel: int
+        msec: float
+
     def __init__(self, timers):
         self.timers = timers
         self.event_counters = {}
+        self.bandwidth_counter = __class__.BandwidthCounter(
+            element_size=2,
+            numel=0,
+            msec=0.0,
+        )
 
     def reset_events(self):
         for event_ctr in self.event_counters.values():
@@ -46,6 +56,8 @@ class PartitionedParameterProfiler(object):
         assert name in self.event_counters, f'unknown event {name}'
         self.event_counters[name].increment(num_elem)
         self.timers(name).stop()
+        self.bandwidth_counter.numel += num_elem
+        self.bandwidth_counter.msec += self.timers(name).elapsed(reset=False)
 
     def _log_timers(self):
         if self.timers is None:
@@ -59,54 +71,13 @@ class PartitionedParameterProfiler(object):
                 #f'{event_ctr.name}: time = {self._log_timers()},count = {event_ctr.count}, numel = {event_ctr.num_elem}',
                 ranks=[0])
 
-    def _log_bandwidth_impl(self, numel: int, msec: float) -> str:
-        ELEMENT_SIZE: int = 2
-        bytes: int = numel * ELEMENT_SIZE
-        giga_bytes: float = float(bytes) / 1024 / 1024 / 1024
-        sec: float = msec / 1000
-        bandwidth: float = giga_bytes / sec
-        return f'bandwidth = {bandwidth} GB/s | numel = {numel} | size = {giga_bytes} GB | time = {msec} ms'
-
-    def _log_bandwidth(self, fwd: bool = False, bwd: bool = False):
-        # forward_fetch_submit: __class__.EventCounter = self.event_counters['forward_fetch_submit']
-        # forward_fetch_wait: __class__.EventCounter = self.event_counters['forward_fetch_wait']
-        # forward_prefetch_submit: __class__.EventCounter = self.event_counters['forward_prefetch_submit']
-        # backward_fetch_submit: __class__.EventCounter = self.event_counters['backward_fetch_submit']
-        # backward_fetch_wait: __class__.EventCounter = self.event_counters['backward_fetch_wait']
-        # backward_prefetch_submit: __class__.EventCounter = self.event_counters['backward_prefetch_submit']
-        forward_all_gather: __class__.EventCounter | None = self.event_counters.get('forward_all_gather')
-        backward_all_gather: __class__.EventCounter | None = self.event_counters.get('backward_all_gather')
-        forward_all_gather_numel = 0 if forward_all_gather is None else forward_all_gather.num_elem
-        backward_all_gather_numel = 0 if backward_all_gather is None else backward_all_gather.num_elem
-        forward_numel = forward_all_gather_numel
-        backward_numel = backward_all_gather_numel
-        total_numel = forward_numel + backward_numel
-
-        forward_fetch_submit_msec = self.timers('forward_fetch_submit').elapsed(reset=False)
-        forward_fetch_wait_msec = self.timers('forward_fetch_wait').elapsed(reset=False)
-        forward_prefetch_submit_msec = self.timers('forward_prefetch_submit').elapsed(reset=False)
-        backward_fetch_submit_msec = self.timers('backward_fetch_submit').elapsed(reset=False)
-        backward_fetch_wait_msec = self.timers('backward_fetch_wait').elapsed(reset=False)
-        backward_prefetch_submit_msec = self.timers('backward_prefetch_submit').elapsed(reset=False)
-        forward_all_gather_msec = self.timers('forward_all_gather').elapsed(reset=False)
-        backward_all_gather_msec = self.timers('backward_all_gather').elapsed(reset=False)
-        forward_msec = forward_fetch_submit_msec + forward_fetch_wait_msec + forward_prefetch_submit_msec + forward_all_gather_msec
-        backward_msec = backward_fetch_submit_msec + backward_fetch_wait_msec + backward_prefetch_submit_msec + backward_all_gather_msec
-        total_msec = forward_msec + backward_msec
-
-        my_rank: int = dist.get_rank() if dist.is_initialized() else -1
-        forward_bandwidth = self._log_bandwidth_impl(total_numel, total_msec)
-        backward_bandwidth = self._log_bandwidth_impl(total_numel, total_msec)
-        total_bandwidth = self._log_bandwidth_impl(total_numel, total_msec)
-
-        message = f'[Rank {my_rank}] {total_bandwidth}';
-        if fwd:
-            message += f'\n\tforward: {forward_bandwidth}'
-        if bwd:
-            message += f'\n\tbackward: {backward_bandwidth}'
-        print(message)
-
     def log_events(self):
         self._log_event_counters()
         self._log_timers()
-        self._log_bandwidth()
+
+    def log_bandwidth(self, reset: bool=True):
+        bytes: int = self.bandwidth_counter.element_size * self.bandwidth_counter.numel
+        giga_bytes: float = float(bytes) / (1024 ** 3)
+        sec: float = self.bandwidth_counter.msec / 1000
+        bandwidth: float = giga_bytes / sec
+        return f'bandwidth = {bandwidth} GB/s | numel = {self.bandwidth_counter.numel} | size = {giga_bytes} GB | time = {self.bandwidth_counter.msec} ms'
